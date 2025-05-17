@@ -73,10 +73,53 @@ class InternVL3Embedder:
         pixel_values = self.encode_image(image_path)
         prompt = "<image>\n" + text_prompt
         if generation_config is None:
-            generation_config = dict(max_new_tokens=512, do_sample=True)
-        return self.model.chat(self.tokenizer, pixel_values, prompt, generation_config)
+            generation_config = dict(max_new_tokens=512, do_sample=True, output_hidden_states=True, return_dict=True)
+        outputs = self.model.chat(self.tokenizer, pixel_values, prompt, generation_config)
+        fused_hidden = outputs.hidden_states[-1]  # [1, T+L, D]
+        return fused_hidden[:, 0, :] if return_cls_only else fused_hidden
+        
 
     def get_image_embedding(self, image_path):
         pixel_values = self.encode_image(image_path)
         with torch.no_grad():
-            return self.model.encode_image(pixel_values)  # used for downstream VLA (e.g. GR00T/RDT)
+            outputs = self.model.vision_model(pixel_values)
+            return outputs.last_hidden_state  # [B, N, D]
+
+    def get_fused_image_text_embedding(self, image_path, text_prompt, return_cls_only=True):
+        pixel_values = self.encode_image(image_path)  # [T, 3, 448, 448]
+        num_tiles = pixel_values.shape[0]
+
+        # 构造 prompt：必须包含 <image> 占位符
+        prompt = "<image>\n" + text_prompt
+
+        # 构造 image_flags: 每个 tile = 1
+        image_flags = torch.ones((num_tiles,), dtype=torch.long).to(self.device)
+
+        # 构造模板 prompt，替换 <image> 为 <img><IMG_CONTEXT>*n</img>
+        IMG_CONTEXT_TOKEN = "<IMG_CONTEXT>"
+        IMG_START_TOKEN = "<img>"
+        IMG_END_TOKEN = "</img>"
+        image_tokens = IMG_START_TOKEN + IMG_CONTEXT_TOKEN * self.model.num_image_token * 1 + IMG_END_TOKEN
+        prompt = prompt.replace("<image>", image_tokens, 1)
+
+        # 构建 tokenizer 输出
+        model_inputs = self.tokenizer(prompt, return_tensors="pt").to(self.device)
+        input_ids = model_inputs["input_ids"]
+        attention_mask = model_inputs["attention_mask"]
+
+        # 设置必须字段
+        self.model.img_context_token_id = self.tokenizer.convert_tokens_to_ids(IMG_CONTEXT_TOKEN)
+
+        # 模型 forward 推理（返回 hidden_states）
+        with torch.no_grad():
+            outputs = self.model(
+                pixel_values=pixel_values,
+                image_flags=image_flags,
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                output_hidden_states=True,
+                return_dict=True
+            )
+
+            fused_hidden = outputs.hidden_states[-1]  # [1, T+L, D]
+            return fused_hidden[:, 0, :] if return_cls_only else fused_hidden
